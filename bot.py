@@ -1,5 +1,7 @@
 import asyncio
+import hashlib
 import html
+import json
 import logging
 import os
 import re
@@ -7,7 +9,7 @@ import time
 import uuid
 from collections import defaultdict, deque
 
-from aiohttp import web
+from aiohttp import ClientSession, ClientTimeout, web
 from aiogram import Bot, Dispatcher, F, types
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
@@ -26,30 +28,119 @@ ADMIN_ID = int(ADMIN_ID_RAW)
 
 SITE_URL = os.getenv("SITE_URL", "https://outadevinc-commits.github.io/Dristick-Tester-Bot/")
 DOWNLOAD_URL = os.getenv("DOWNLOAD_URL", "https://drive.google.com")
-# Откуда сайту разрешено слать отчёты (через запятую). Только origin, без пути.
 ALLOWED_ORIGINS = {
     o.strip()
     for o in os.getenv("ALLOWED_ORIGINS", "https://outadevinc-commits.github.io").split(",")
     if o.strip()
 }
 
+# Хранилище очков. Если заданы обе переменные — очки живут в Upstash Redis и
+# переживают любые деплои. Иначе — файл (сбрасывается при деплое на Render).
+UPSTASH_URL = os.getenv("UPSTASH_REDIS_REST_URL", "").rstrip("/")
+UPSTASH_TOKEN = os.getenv("UPSTASH_REDIS_REST_TOKEN", "")
+DATA_FILE = os.getenv("DATA_FILE", "data.json")
+STATE_KEY = "dristick_state"
+
+DEDUP_WINDOW = 24 * 3600  # одинаковый отчёт повторно не принимаем 24 часа
+
 # action -> (очки, это баг?, статус для админа, уведомление тестеру)
 ACTIONS = {
-    "accept": (5, False, "✅ Отчёт принят (+5)", "🎉 Твой отчёт по Dristick Tester принят разработчиком! (+5 очков в /top)"),
-    "bug": (10, True, "🐛 Баг зафиксирован (+10)", "🐛 Разработчик зафиксировал твой баг! (+10 очков в /top)"),
-    "title": (15, False, "👑 Титул утверждён (+15)", "👑 Твой титул одобрен! (+15 очков в /top)"),
+    "accept": (5, False, "✅ Отчёт принят (+5)", "🎉 Твой отчёт по Dristick Tester принят разработчиком! (+5 очков)"),
+    "bug": (10, True, "🐛 Баг зафиксирован (+10)", "🐛 Разработчик зафиксировал твой баг! (+10 очков)"),
+    "title": (15, False, "👑 Титул утверждён (+15)", "👑 Твой титул одобрен! (+15 очков)"),
     "reject": (0, False, "❌ Отчёт отклонён", "ℹ️ Твой отчёт был отклонён разработчиком."),
 }
+STAT_KEYS = {"accept": "accepted", "bug": "bugs", "title": "titles", "reject": "rejected"}
 
-# ───────────── Хранилище (в памяти, сбрасывается при рестарте) ─────────────
-leaderboard: dict[str, dict] = {}
+# Звания по очкам: (минимум очков, название)
+RANKS = [
+    (0, "🆕 Новичок"),
+    (20, "🔍 Тестер"),
+    (50, "🐛 Охотник на баги"),
+    (100, "⚔️ Ветеран"),
+    (200, "👑 Легенда"),
+]
+
+# ───────────── Состояние ─────────────
+leaderboard: dict[str, dict] = {}   # "@user" или ник -> {"points", "bugs", "reports"}
+known_users: dict[str, int] = {}    # username (lower) -> chat_id (кто писал боту)
+seen: dict[str, float] = {}         # отпечаток отчёта -> время (защита от дублей)
+stats = {"total": 0, "accepted": 0, "bugs": 0, "titles": 0, "rejected": 0}
+
+# Не сохраняется (живёт до рестарта)
 reports: dict[str, dict] = {}       # report_id -> {"nick", "tg"}
 done: set[str] = set()              # уже обработанные отчёты
-known_users: dict[str, int] = {}    # username (lower) -> chat_id (кто нажимал /start)
+reply_state: dict = {}              # кому админ сейчас пишет ответ
 hits: dict[str, deque] = defaultdict(deque)  # антиспам по IP
+save_lock = asyncio.Lock()
 
 bot = Bot(token=BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
 dp = Dispatcher()
+
+
+# ───────────── Хранилище ─────────────
+def upstash_enabled() -> bool:
+    return bool(UPSTASH_URL and UPSTASH_TOKEN)
+
+
+async def upstash(command: list):
+    async with ClientSession(timeout=ClientTimeout(total=15)) as session:
+        async with session.post(
+            UPSTASH_URL, json=command, headers={"Authorization": f"Bearer {UPSTASH_TOKEN}"}
+        ) as resp:
+            data = await resp.json()
+            if resp.status != 200 or "error" in data:
+                raise RuntimeError(f"Upstash {resp.status}: {data}")
+            return data.get("result")
+
+
+async def load_state():
+    raw = None
+    if upstash_enabled():
+        for attempt in range(1, 4):
+            try:
+                raw = await upstash(["GET", STATE_KEY])
+                break
+            except Exception as exc:
+                logging.warning("Upstash: не удалось загрузить (%s/3): %s", attempt, exc)
+                if attempt == 3:
+                    # Лучше не запускаться, чем стартовать пустым и затереть очки.
+                    raise SystemExit("Не удалось загрузить данные из Upstash — выхожу, чтобы не затереть очки.")
+                await asyncio.sleep(3)
+    elif os.path.exists(DATA_FILE):
+        with open(DATA_FILE, encoding="utf-8") as f:
+            raw = f.read()
+
+    if raw:
+        data = json.loads(raw)
+        leaderboard.update(data.get("leaderboard", {}))
+        known_users.update({k: int(v) for k, v in data.get("users", {}).items()})
+        seen.update({k: float(v) for k, v in data.get("seen", {}).items()})
+        stats.update(data.get("stats", {}))
+    logging.info(
+        "Хранилище: %s | тестеров: %d, пользователей: %d",
+        "Upstash" if upstash_enabled() else f"файл {DATA_FILE}",
+        len(leaderboard),
+        len(known_users),
+    )
+
+
+async def save_state():
+    async with save_lock:
+        payload = json.dumps(
+            {"leaderboard": leaderboard, "users": known_users, "seen": seen, "stats": stats},
+            ensure_ascii=False,
+        )
+        try:
+            if upstash_enabled():
+                await upstash(["SET", STATE_KEY, payload])
+            else:
+                tmp = DATA_FILE + ".tmp"
+                with open(tmp, "w", encoding="utf-8") as f:
+                    f.write(payload)
+                os.replace(tmp, DATA_FILE)
+        except Exception:
+            logging.exception("Не удалось сохранить данные (память в порядке, повторю при следующем изменении)")
 
 
 # ───────────── Хелперы ─────────────
@@ -63,18 +154,36 @@ def norm_tg(value) -> str | None:
 
 
 def extract_user_info(text: str):
-    """Запасной вариант: достаём ник и @username из текста сообщения."""
+    """Запасной вариант (после рестарта): достаём ник и @username из текста сообщения."""
     tg = re.search(r"Telegram:\s*@?([A-Za-z0-9_]+)", text, re.IGNORECASE)
     nick = re.search(r"Никнейм:\s*(.+)", text, re.IGNORECASE)
     return (tg.group(1) if tg else None), (nick.group(1).strip() if nick else "Аноним")
 
 
+def rank_for(points: int) -> str:
+    name = RANKS[0][1]
+    for need, title in RANKS:
+        if points >= need:
+            name = title
+    return name
+
+
+def next_rank(points: int):
+    for need, title in RANKS:
+        if points < need:
+            return need, title
+    return None
+
+
 def add_points(user_key: str, points: int, is_bug: bool = False):
-    row = leaderboard.setdefault(user_key, {"points": 0, "bugs": 0, "reports": 0})
+    key = next((k for k in leaderboard if k.lower() == user_key.lower()), user_key)
+    row = leaderboard.setdefault(key, {"points": 0, "bugs": 0, "reports": 0})
+    old = row["points"]
     row["points"] += points
     row["reports"] += 1
     if is_bug:
         row["bugs"] += 1
+    return key, old, row["points"]
 
 
 def report_keyboard(rid: str) -> InlineKeyboardMarkup:
@@ -84,14 +193,24 @@ def report_keyboard(rid: str) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
         [btn("✅ Принято (+5)", "accept"), btn("🐛 Баг (+10)", "bug")],
         [btn("👑 Титул (+15)", "title"), btn("❌ Отклонить", "reject")],
+        [btn("💬 Ответить", "reply")],
     ])
 
 
-def remember(message: types.Message):
+def reply_only_keyboard(rid: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="💬 Ответить", callback_data=f"rep:reply:{rid}")]
+    ])
+
+
+async def remember(message: types.Message):
     """Запоминаем chat_id по @username, чтобы потом можно было написать человеку."""
     user = message.from_user
-    if user and user.username:
-        known_users[user.username.lower()] = message.chat.id
+    if user and user.username and message.chat.type == "private":
+        key = user.username.lower()
+        if known_users.get(key) != message.chat.id:
+            known_users[key] = message.chat.id
+            await save_state()
 
 
 async def notify_user(tg: str | None, text: str) -> str | None:
@@ -109,9 +228,23 @@ async def notify_user(tg: str | None, text: str) -> str | None:
     return None
 
 
+def fingerprint(nick: str, tg: str | None, category: str, media: str, desc: str) -> str:
+    raw = "|".join([nick.lower(), (tg or "").lower(), category.lower(), media.lower(), " ".join(desc.lower().split())])
+    return hashlib.sha1(raw.encode()).hexdigest()[:16]
+
+
+def is_duplicate(fp: str) -> bool:
+    now = time.time()
+    for key in [k for k, t in seen.items() if now - t > DEDUP_WINDOW]:
+        del seen[key]
+    return fp in seen
+
+
 async def send_report(nick: str, tg: str | None, title: str, category: str, media: str, desc: str):
     rid = uuid.uuid4().hex[:8]
     reports[rid] = {"nick": nick, "tg": tg}
+    if len(reports) > 300:
+        reports.pop(next(iter(reports)))
     e = html.escape
     text = (
         "📬 <b>НОВЫЙ ОТЧЁТ (Dristick Tester)</b>\n\n"
@@ -126,10 +259,20 @@ async def send_report(nick: str, tg: str | None, title: str, category: str, medi
 
 
 # ───────────── Команды ─────────────
+async def remember_middleware(handler, event, data):
+    await remember(event)
+    return await handler(event, data)
+
+
+dp.message.outer_middleware(remember_middleware)
+
+
 @dp.message(Command("start"))
 async def cmd_start(message: types.Message):
-    remember(message)
-    await message.answer("🕹️ <b>Dristick Tester Bot активен!</b>\nКоманды: /site, /top, /download")
+    await message.answer(
+        "🕹️ <b>Dristick Tester Bot активен!</b>\n"
+        "Команды: /me — твои очки и звание, /top — таблица лидеров, /site, /download"
+    )
 
 
 @dp.message(Command("site"))
@@ -150,8 +293,60 @@ async def cmd_top(message: types.Message):
     top = sorted(leaderboard.items(), key=lambda x: x[1]["points"], reverse=True)[:10]
     text = "🏆 <b>ТОП ТЕСТИРОВЩИКОВ</b> 🏆\n\n"
     for idx, (user, data) in enumerate(top, 1):
-        text += f"{idx}. <b>{html.escape(user)}</b> — <b>{data['points']}</b> очков\n"
+        text += f"{idx}. <b>{html.escape(user)}</b> — <b>{data['points']}</b> очков · {rank_for(data['points'])}\n"
     await message.answer(text)
+
+
+@dp.message(Command("me"))
+async def cmd_me(message: types.Message):
+    username = message.from_user.username
+    if not username:
+        await message.answer("У тебя нет @username в Telegram, по нему я ищу твои очки. Задай его в настройках Telegram.")
+        return
+    key = next((k for k in leaderboard if k.lower() == f"@{username}".lower()), None)
+    if not key:
+        await message.answer(f"Пока нет начисленных очков. Отправь отчёт на сайте:\n{html.escape(SITE_URL)}")
+        return
+    row = leaderboard[key]
+    ordered = sorted(leaderboard, key=lambda k: leaderboard[k]["points"], reverse=True)
+    text = (
+        f"👤 <b>{html.escape(key)}</b>\n"
+        f"🎖 Звание: {rank_for(row['points'])}\n"
+        f"⭐ Очки: <b>{row['points']}</b> (место {ordered.index(key) + 1} из {len(ordered)})\n"
+        f"🐛 Баги: {row['bugs']}\n"
+        f"📨 Принятых отчётов: {row['reports']}"
+    )
+    nxt = next_rank(row["points"])
+    if nxt:
+        text += f"\n⏭ До звания «{nxt[1]}»: {nxt[0] - row['points']} очков"
+    await message.answer(text)
+
+
+@dp.message(Command("stats"))
+async def cmd_stats(message: types.Message):
+    if message.from_user.id != ADMIN_ID:
+        return
+    pending = max(0, stats["total"] - stats["accepted"] - stats["bugs"] - stats["titles"] - stats["rejected"])
+    storage = "Upstash (очки переживают деплои)" if upstash_enabled() else "файл (сбросится при деплое!)"
+    await message.answer(
+        "📊 <b>Статистика</b>\n\n"
+        f"📨 Всего отчётов: {stats['total']}\n"
+        f"✅ Принято: {stats['accepted']}\n"
+        f"🐛 Багов: {stats['bugs']}\n"
+        f"👑 Титулов: {stats['titles']}\n"
+        f"❌ Отклонено: {stats['rejected']}\n"
+        f"⏳ Ждут решения: {pending}\n\n"
+        f"🏆 Тестеров в топе: {len(leaderboard)}\n"
+        f"👥 Писали боту: {len(known_users)}\n"
+        f"💾 Хранилище: {storage}"
+    )
+
+
+@dp.message(Command("cancel"))
+async def cmd_cancel(message: types.Message):
+    if message.from_user.id == ADMIN_ID and reply_state:
+        reply_state.clear()
+        await message.answer("Отменено.")
 
 
 # ───────────── Кнопки под отчётом ─────────────
@@ -166,6 +361,27 @@ async def on_report_action(cb: CallbackQuery):
     except ValueError:
         await cb.answer()
         return
+
+    text = cb.message.text or cb.message.caption or ""
+    rep = reports.get(rid)
+    if rep:
+        tg, nick = rep["tg"], rep["nick"]
+    else:  # после рестарта сервера — берём данные из текста сообщения
+        tg, nick = extract_user_info(text)
+    user_key = f"@{tg}" if tg else nick
+
+    # 💬 Ответить тестеру
+    if action == "reply":
+        chat_id = known_users.get(tg.lower()) if tg else None
+        if not chat_id:
+            await cb.answer("Ответить нельзя: нет @username или тестер ещё не писал боту /start", show_alert=True)
+            return
+        reply_state.clear()
+        reply_state.update(chat_id=chat_id, label=user_key)
+        await cb.message.answer(f"✍️ Напиши ответ для {html.escape(user_key)} одним сообщением. Отмена — /cancel")
+        await cb.answer()
+        return
+
     if action not in ACTIONS:
         await cb.answer()
         return
@@ -175,31 +391,44 @@ async def on_report_action(cb: CallbackQuery):
     done.add(rid)
 
     points, is_bug, status, user_msg = ACTIONS[action]
-    rep = reports.pop(rid, None)
-    if rep:
-        tg, nick = rep["tg"], rep["nick"]
-    else:  # после рестарта сервера — берём данные из текста сообщения
-        tg, nick = extract_user_info(cb.message.text or cb.message.caption or "")
-    user_key = f"@{tg}" if tg else nick
-
+    rank_line = ""
     if points:
-        add_points(user_key, points, is_bug)
+        user_key, old, new = add_points(user_key, points, is_bug)
+        user_msg += f"\n⭐ Всего очков: {new}"
+        if rank_for(new) != rank_for(old):
+            rank_line = f"🎖 Новое звание: {rank_for(new)}"
+            user_msg += f"\n{rank_line}"
+    stats[STAT_KEYS[action]] += 1
+    await save_state()
+
     problem = await notify_user(tg, user_msg)
 
     status_line = f"{status} — {html.escape(user_key)}"
+    if rank_line:
+        status_line += f"\n{rank_line}"
     if problem:
         status_line += f"\n⚠️ {html.escape(problem)}"
     try:
-        await cb.message.edit_text(f"{cb.message.html_text}\n\n{status_line}", reply_markup=None)
+        await cb.message.edit_text(f"{cb.message.html_text}\n\n{status_line}", reply_markup=reply_only_keyboard(rid))
     except TelegramBadRequest:
-        await cb.message.edit_reply_markup(reply_markup=None)
+        await cb.message.edit_reply_markup(reply_markup=reply_only_keyboard(rid))
         await cb.message.reply(status_line)
     await cb.answer("Готово")
 
 
-@dp.message()
-async def on_any_message(message: types.Message):
-    remember(message)
+@dp.message(F.from_user.id == ADMIN_ID, F.text, ~F.text.startswith("/"))
+async def admin_reply(message: types.Message):
+    """Следующее сообщение админа после кнопки «💬 Ответить» уходит тестеру."""
+    if not reply_state:
+        return
+    target = dict(reply_state)
+    reply_state.clear()
+    try:
+        await bot.send_message(target["chat_id"], f"💬 <b>Ответ разработчика:</b>\n{html.escape(message.text)}")
+        await message.answer(f"✅ Отправлено: {html.escape(target['label'])}")
+    except Exception as exc:
+        logging.warning("Не удалось отправить ответ: %s", exc)
+        await message.answer("⚠️ Не удалось отправить ответ.")
 
 
 # ───────────── HTTP: приём отчётов с сайта ─────────────
@@ -250,18 +479,26 @@ async def handle_report(request: web.Request):
     if not nick:
         return web.json_response({"ok": False, "error": "nickname_required"}, status=400)
 
+    tg = norm_tg(data.get("telegram"))
+    title = clean(data.get("title"), 64) or "Не указан"
+    category = clean(data.get("type"), 32) or "Не указана"
+    media = clean(data.get("media"), 500) or "нет"
+    desc = clean(data.get("description"), 2000) or "Без описания"
+
+    fp = fingerprint(nick, tg, category, media, desc)
+    if is_duplicate(fp):
+        return web.json_response({"ok": False, "error": "duplicate"}, status=409)
+    seen[fp] = time.time()
+
     try:
-        await send_report(
-            nick=nick,
-            tg=norm_tg(data.get("telegram")),
-            title=clean(data.get("title"), 64) or "Не указан",
-            category=clean(data.get("type"), 32) or "Не указана",
-            media=clean(data.get("media"), 500) or "нет",
-            desc=clean(data.get("description"), 2000) or "Без описания",
-        )
+        await send_report(nick, tg, title, category, media, desc)
     except Exception:
+        seen.pop(fp, None)
         logging.exception("Не удалось отправить отчёт админу")
         return web.json_response({"ok": False, "error": "telegram_error"}, status=502)
+
+    stats["total"] += 1
+    await save_state()
     return web.json_response({"ok": True})
 
 
@@ -274,6 +511,7 @@ def build_app() -> web.Application:
 
 
 async def main():
+    await load_state()
     runner = web.AppRunner(build_app())
     await runner.setup()
     await web.TCPSite(runner, "0.0.0.0", int(os.getenv("PORT", 10000))).start()
