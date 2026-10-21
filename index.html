@@ -104,6 +104,8 @@
             if (res.ok && data.ok) {
                 setStatus("✅ Отчёт успешно отправлен!", "ok");
                 form.reset();
+            } else if (res.status === 409) {
+                setStatus("Такой отчёт уже отправлен", "err");
             } else if (res.status === 429) {
                 setStatus("Слишком часто, подожди минуту", "err");
             } else {
