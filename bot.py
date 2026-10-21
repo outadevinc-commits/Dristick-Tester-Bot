@@ -1,6 +1,7 @@
 import logging
 import asyncio
 import os
+from aiohttp import web
 from aiogram import Bot, Dispatcher, types
 from aiogram.filters import Command
 from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery
@@ -9,8 +10,8 @@ from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton, CallbackQu
 BOT_TOKEN = os.getenv("BOT_TOKEN", "8839895562:AAELe4fHssbswyDOCg2WPmfJ26lnRPmoRgM")
 ADMIN_ID = int(os.getenv("ADMIN_ID", "5876046214"))
 
-SITE_URL = "https://твой-ник.github.io/dristick-tester" 
-DOWNLOAD_URL = "https://drive.google.com/your-game-build"
+SITE_URL = "https://outadevinc-commits.github.io/Dristick-Tester-Bot/" 
+DOWNLOAD_URL = "https://drive.google.com"
 
 stats = {
     "total_reports": 0,
@@ -129,9 +130,25 @@ async def handle_incoming_reports(message: types.Message):
             reply_markup=get_report_keyboard(stats["total_reports"])
         )
 
+# Функция для обмана Render, чтобы он думал, будто запущен сайт (убирает тайм-аут)
+async def handle_web(request):
+    return web.Response(text="Dristick Bot is running!")
+
+async def web_server():
+    app = web.Application()
+    app.router.add_get("/", handle_web)
+    runner = web.AppRunner(app)
+    await runner.setup()
+    port = int(os.getenv("PORT", 10000))
+    site = web.TCPSite(runner, "0.0.0.0", port)
+    await site.start()
+
 async def main():
     print("🚀 Бот Dristick Tester запущен!")
-    await dp.start_polling(bot)
+    # Запускаем и веб-сервер для Render, и самого телеграм-бота одновременно
+    await asyncio.gather(web_server(), dp.start_polling(bot))
 
 if __name__ == "__main__":
     asyncio.run(main())
+
+
