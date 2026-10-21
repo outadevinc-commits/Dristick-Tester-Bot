@@ -1,0 +1,167 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Dristick Tester — Форма Отчёта</title>
+    <style>
+        body {
+            background-color: #0f0f13;
+            color: #f0f0f0;
+            font-family: 'Courier New', Courier, monospace;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            min-height: 100vh;
+            margin: 0;
+            padding: 20px;
+            box-sizing: border-box;
+        }
+        .container {
+            background: #1a1a24;
+            border: 2px solid #4a4a6a;
+            box-shadow: 0 0 15px rgba(0, 0, 0, 0.7);
+            border-radius: 8px;
+            padding: 25px;
+            max-width: 480px;
+            width: 100%;
+        }
+        h1 {
+            color: #00ffcc;
+            text-align: center;
+            font-size: 22px;
+            margin-bottom: 20px;
+            text-transform: uppercase;
+            letter-spacing: 1px;
+        }
+        label {
+            display: block;
+            margin-top: 15px;
+            font-weight: bold;
+            color: #a0a0c0;
+            font-size: 14px;
+        }
+        input, select, textarea {
+            width: 100%;
+            padding: 10px;
+            margin-top: 5px;
+            background: #0f0f13;
+            border: 1px solid #3a3a52;
+            color: #fff;
+            border-radius: 4px;
+            box-sizing: border-box;
+            font-family: inherit;
+        }
+        input:focus, select:focus, textarea:focus {
+            outline: none;
+            border-color: #00ffcc;
+        }
+        button {
+            width: 100%;
+            background: #00ffcc;
+            color: #000;
+            border: none;
+            padding: 12px;
+            margin-top: 20px;
+            font-size: 16px;
+            font-weight: bold;
+            cursor: pointer;
+            border-radius: 4px;
+            transition: 0.2s;
+        }
+        button:hover {
+            background: #00cca3;
+        }
+        .note {
+            font-size: 11px;
+            color: #7a7a9a;
+            margin-top: 15px;
+            text-align: center;
+        }
+    </style>
+</head>
+<body>
+
+<div class="container">
+    <h1>🕹️ Dristick Tester</h1>
+    <p style="text-align: center; font-size: 13px; color: #8a8aab;">Форма отправки багов и геймплея</p>
+    
+    <form id="reportForm">
+        <label for="nickname">Игровой никнейм:</label>
+        <input type="text" id="nickname" placeholder="Например: Player1" required>
+
+        <label for="telegram">Telegram Username (@username):</label>
+        <input type="text" id="telegram" placeholder="@username (для уведомлений)">
+
+        <label for="title">Желаемый титул в игре:</label>
+        <input type="text" id="title" placeholder="Например: Покоритель багов">
+
+        <label for="type">Тип отчёта:</label>
+        <select id="type">
+            <option value="Багрепорт 🐛">🐛 Багрепорт / Ошибка</option>
+            <option value="Геймплей 🎥">🎥 Чистый геймплей / Тестирование</option>
+            <option value="Идея 💡">💡 Идея / Предложение</option>
+        </select>
+
+        <label for="media">Ссылка на видео/скриншот (Google Drive / YouTube / Imgur):</label>
+        <input type="url" id="media" placeholder="https://..." required>
+
+        <label for="description">Описание / Как повторить баг:</label>
+        <textarea id="description" rows="4" placeholder="Опиши подробно, что произошло..."></textarea>
+
+        <button type="submit">🚀 Отправить отчёт</button>
+    </form>
+
+    <div class="note">Отчёт автоматически поступит в Telegram-бот разработчика.</div>
+</div>
+
+<script>
+    // Настройки Telegram бота
+    const BOT_TOKEN = "8839895562:AAELe4fHssbswyDOCg2WPmfJ26lnRPmoRgM";
+    const CHAT_ID = "5876046214";
+
+    document.getElementById('reportForm').addEventListener('submit', function(e) {
+        e.preventDefault();
+
+        const nick = document.getElementById('nickname').value;
+        const tg = document.getElementById('telegram').value;
+        const title = document.getElementById('title').value || "Не указан";
+        const type = document.getElementById('type').value;
+        const media = document.getElementById('media').value;
+        const desc = document.getElementById('description').value || "Без описания";
+
+        const text = `📬 **НОВЫЙ ОТЧЁТ (Dristick Tester)**\n\n` +
+                     `👤 **Никнейм:** ${nick}\n` +
+                     `📱 **Telegram:** ${tg}\n` +
+                     `👑 **Титул:** ${title}\n` +
+                     `📌 **Категория:** ${type}\n\n` +
+                     `🔗 **Медиа:** ${media}\n` +
+                     `📝 **Описание:** ${desc}`;
+
+        fetch(`https://api.telegram.org/bot${BOT_TOKEN}/sendMessage`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+                chat_id: CHAT_ID,
+                text: text,
+                parse_mode: 'Markdown'
+            })
+        })
+        .then(response => response.json())
+        .then(data => {
+            if(data.ok) {
+                alert('✅ Отчёт успешно отправлен разработчику!');
+                document.getElementById('reportForm').reset();
+            } else {
+                alert('❌ Ошибка отправки. Проверьте данные.');
+            }
+        })
+        .catch(error => {
+            alert('❌ Ошибка сети!');
+            console.error(error);
+        });
+    });
+</script>
+
+</body>
+</html>
