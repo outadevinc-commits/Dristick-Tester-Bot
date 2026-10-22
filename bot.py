@@ -15,7 +15,7 @@ from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
 from aiogram.exceptions import TelegramBadRequest
 from aiogram.filters import Command
-from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup
+from aiogram.types import BufferedInputFile, CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup
 
 logging.basicConfig(level=logging.INFO)
 
@@ -42,6 +42,13 @@ DATA_FILE = os.getenv("DATA_FILE", "data.json")
 STATE_KEY = "dristick_state"
 
 DEDUP_WINDOW = 24 * 3600  # одинаковый отчёт повторно не принимаем 24 часа
+
+# Загрузка файлов с сайта. Telegram не принимает от бота файлы больше 50 МБ.
+MAX_ICON_BYTES = 2 * 1024 * 1024
+MAX_VIDEO_BYTES = int(os.getenv("MAX_VIDEO_MB", "45")) * 1024 * 1024
+MAX_TEXT_FIELD_BYTES = 8000
+TEXT_FIELDS = {"nickname", "telegram", "title", "type", "media", "description"}
+upload_slots = asyncio.Semaphore(2)  # не больше двух одновременных загрузок (экономим память)
 
 # action -> (очки, это баг?, статус для админа, уведомление тестеру)
 ACTIONS = {
@@ -228,8 +235,11 @@ async def notify_user(tg: str | None, text: str) -> str | None:
     return None
 
 
-def fingerprint(nick: str, tg: str | None, category: str, media: str, desc: str) -> str:
-    raw = "|".join([nick.lower(), (tg or "").lower(), category.lower(), media.lower(), " ".join(desc.lower().split())])
+def fingerprint(nick: str, tg: str | None, category: str, link: str, desc: str, video_hash: str = "") -> str:
+    raw = "|".join([
+        nick.lower(), (tg or "").lower(), category.lower(), link.lower(),
+        " ".join(desc.lower().split()), video_hash,
+    ])
     return hashlib.sha1(raw.encode()).hexdigest()[:16]
 
 
@@ -240,22 +250,116 @@ def is_duplicate(fp: str) -> bool:
     return fp in seen
 
 
-async def send_report(nick: str, tg: str | None, title: str, category: str, media: str, desc: str):
+# ───────────── Файлы: проверка по содержимому ─────────────
+def sniff_image(data: bytes) -> str | None:
+    if data.startswith(b"\x89PNG\r\n\x1a\n"):
+        return "png"
+    if data.startswith(b"\xff\xd8\xff"):
+        return "jpg"
+    if data[:4] == b"RIFF" and data[8:12] == b"WEBP":
+        return "webp"
+    return None
+
+
+def sniff_video(data: bytes) -> str | None:
+    if data[4:8] == b"ftyp":
+        return "mov" if data[8:12] == b"qt  " else "mp4"
+    if data[:4] == b"\x1a\x45\xdf\xa3":
+        return "webm"
+    return None
+
+
+class UploadError(Exception):
+    def __init__(self, status: int, code: str):
+        self.status, self.code = status, code
+
+
+async def read_limited(part, limit: int, error: UploadError) -> bytes:
+    buf = bytearray()
+    while True:
+        chunk = await part.read_chunk(64 * 1024)
+        if not chunk:
+            return bytes(buf)
+        buf += chunk
+        if len(buf) > limit:
+            raise error
+
+
+async def parse_multipart(request: web.Request):
+    fields: dict[str, str] = {}
+    icon = video = b""
+    reader = await request.multipart()
+    async for part in reader:
+        name = part.name
+        if name == "icon":
+            icon = await read_limited(part, MAX_ICON_BYTES, UploadError(413, "icon_too_large"))
+        elif name == "video":
+            video = await read_limited(part, MAX_VIDEO_BYTES, UploadError(413, "video_too_large"))
+        elif name in TEXT_FIELDS:
+            raw = await read_limited(part, MAX_TEXT_FIELD_BYTES, UploadError(413, "field_too_large"))
+            fields[name] = raw.decode("utf-8", "ignore")
+        else:
+            await read_limited(part, 1024, UploadError(400, "unexpected_field"))
+    return fields, icon, video
+
+
+async def send_media(nick: str, icon: bytes, icon_ext: str | None, video: bytes, video_ext: str | None) -> list[str]:
+    """Пересылает иконку и видео админу. Возвращает список проблем (пустой — всё ок)."""
+    problems = []
+    label = html.escape(nick)
+    if icon:
+        try:
+            await bot.send_photo(
+                ADMIN_ID, BufferedInputFile(icon, f"icon.{icon_ext}"), caption=f"🖼 Иконка тестера: <b>{label}</b>"
+            )
+        except Exception:
+            logging.exception("Не удалось отправить иконку")
+            problems.append("иконку не удалось переслать")
+    if video:
+        caption = f"🎬 Видео от тестера: <b>{label}</b>"
+        file = BufferedInputFile(video, f"video.{video_ext}")
+        try:
+            await bot.send_video(ADMIN_ID, file, caption=caption, request_timeout=300)
+        except Exception:
+            logging.exception("send_video не прошёл, пробую как документ")
+            try:
+                await bot.send_document(
+                    ADMIN_ID, BufferedInputFile(video, f"video.{video_ext}"), caption=caption, request_timeout=300
+                )
+            except Exception:
+                logging.exception("Не удалось отправить видео")
+                problems.append("видео не удалось переслать")
+    return problems
+
+
+async def send_report(
+    nick: str, tg: str | None, title: str, category: str, link: str, desc: str,
+    icon: bytes = b"", icon_ext: str | None = None, video: bytes = b"", video_ext: str | None = None,
+):
+    problems = await send_media(nick, icon, icon_ext, video, video_ext)
+
     rid = uuid.uuid4().hex[:8]
     reports[rid] = {"nick": nick, "tg": tg}
     if len(reports) > 300:
         reports.pop(next(iter(reports)))
     e = html.escape
-    text = (
-        "📬 <b>НОВЫЙ ОТЧЁТ (Dristick Tester)</b>\n\n"
-        f"👤 <b>Никнейм:</b> {e(nick)}\n"
-        f"📱 <b>Telegram:</b> {'@' + e(tg) if tg else 'нет'}\n"
-        f"👑 <b>Титул:</b> {e(title)}\n"
-        f"📌 <b>Категория:</b> {e(category)}\n\n"
-        f"🔗 <b>Медиа:</b> {e(media)}\n"
-        f"📝 <b>Описание:</b> {e(desc)}"
-    )
-    await bot.send_message(ADMIN_ID, text, reply_markup=report_keyboard(rid))
+
+    lines = [
+        "📬 <b>НОВЫЙ ОТЧЁТ (Dristick Tester)</b>\n",
+        f"👤 <b>Никнейм:</b> {e(nick)}",
+        f"📱 <b>Telegram:</b> {'@' + e(tg) if tg else 'нет'}",
+        f"👑 <b>Титул:</b> {e(title)}",
+        f"📌 <b>Категория:</b> {e(category)}\n",
+    ]
+    if link:
+        lines.append(f"🔗 <b>Ссылка:</b> {e(link)}")
+    if video:
+        lines.append("🎬 <b>Видео:</b> выше" if "видео не удалось переслать" not in problems else "🎬 <b>Видео:</b> ⚠️ не дошло")
+    if icon:
+        lines.append("🖼 <b>Иконка:</b> выше" if "иконку не удалось переслать" not in problems else "🖼 <b>Иконка:</b> ⚠️ не дошла")
+    lines.append(f"📝 <b>Описание:</b> {e(desc)}")
+
+    await bot.send_message(ADMIN_ID, "\n".join(lines), reply_markup=report_keyboard(rid))
 
 
 # ───────────── Команды ─────────────
@@ -463,39 +567,65 @@ async def handle_preflight(request: web.Request):
     return web.Response(status=204)
 
 
+def fail(status: int, code: str) -> web.Response:
+    return web.json_response({"ok": False, "error": code}, status=status)
+
+
 async def handle_report(request: web.Request):
     ip = request.headers.get("X-Forwarded-For", request.remote or "").split(",")[0].strip()
     if rate_limited(ip):
-        return web.json_response({"ok": False, "error": "too_many_requests"}, status=429)
+        return fail(429, "too_many_requests")
 
+    max_total = MAX_VIDEO_BYTES + MAX_ICON_BYTES + 256 * 1024
+    if request.content_length and request.content_length > max_total:
+        return fail(413, "video_too_large")
+
+    icon = video = b""
     try:
-        data = await request.json()
+        async with upload_slots:
+            if request.content_type.startswith("multipart/"):
+                data, icon, video = await parse_multipart(request)
+            else:  # запасной вариант: обычный JSON без файлов
+                data = await request.json()
+                if not isinstance(data, dict):
+                    return fail(400, "bad_json")
+    except UploadError as err:
+        return fail(err.status, err.code)
     except Exception:
-        return web.json_response({"ok": False, "error": "bad_json"}, status=400)
-    if not isinstance(data, dict):
-        return web.json_response({"ok": False, "error": "bad_json"}, status=400)
+        return fail(400, "bad_request")
 
     nick = clean(data.get("nickname"), 64)
     if not nick:
-        return web.json_response({"ok": False, "error": "nickname_required"}, status=400)
+        return fail(400, "nickname_required")
+
+    icon_ext = video_ext = None
+    if icon:
+        icon_ext = sniff_image(icon)
+        if not icon_ext:
+            return fail(400, "bad_icon")
+    if video:
+        video_ext = sniff_video(video)
+        if not video_ext:
+            return fail(400, "bad_video")
 
     tg = norm_tg(data.get("telegram"))
     title = clean(data.get("title"), 64) or "Не указан"
     category = clean(data.get("type"), 32) or "Не указана"
-    media = clean(data.get("media"), 500) or "нет"
+    link = clean(data.get("media"), 500)
     desc = clean(data.get("description"), 2000) or "Без описания"
 
-    fp = fingerprint(nick, tg, category, media, desc)
+    video_hash = hashlib.sha1(video).hexdigest() if video else ""
+    fp = fingerprint(nick, tg, category, link, desc, video_hash)
     if is_duplicate(fp):
-        return web.json_response({"ok": False, "error": "duplicate"}, status=409)
+        return fail(409, "duplicate")
     seen[fp] = time.time()
 
     try:
-        await send_report(nick, tg, title, category, media, desc)
+        await send_report(nick, tg, title, category, link, desc, icon, icon_ext, video, video_ext)
     except Exception:
         seen.pop(fp, None)
         logging.exception("Не удалось отправить отчёт админу")
-        return web.json_response({"ok": False, "error": "telegram_error"}, status=502)
+        return fail(502, "telegram_error")
 
     stats["total"] += 1
     await save_state()
