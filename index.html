@@ -13,14 +13,33 @@
   h1 { margin:0 0 4px; font-size:22px; }
   .sub { margin:0 0 8px; color:var(--muted); font-size:14px; }
   label { display:block; margin:14px 0 6px; font-size:13px; color:var(--muted); }
-  input, select, textarea { width:100%; padding:11px 12px; background:#0f1117; color:var(--text);
+  .opt { color:#6f7388; }
+  input[type=text], select, textarea { width:100%; padding:11px 12px; background:#0f1117; color:var(--text);
          border:1px solid var(--line); border-radius:8px; font:inherit; }
-  input:focus, select:focus, textarea:focus { outline:none; border-color:var(--accent); }
+  input[type=text]:focus, select:focus, textarea:focus { outline:none; border-color:var(--accent); }
   textarea { min-height:110px; resize:vertical; }
-  button { width:100%; margin-top:20px; padding:13px; border:0; border-radius:8px; background:var(--accent);
+  input[type=file] { display:none; }
+
+  .pick { display:flex; align-items:center; gap:12px; }
+  .icon-preview { width:64px; height:64px; flex:none; border-radius:50%; background:#0f1117; border:1px dashed var(--line);
+         display:flex; align-items:center; justify-content:center; font-size:26px; overflow:hidden; }
+  .icon-preview img { width:100%; height:100%; object-fit:cover; display:block; }
+  .pick-info { flex:1; min-width:0; }
+  .file-name { font-size:13px; color:var(--muted); white-space:nowrap; overflow:hidden; text-overflow:ellipsis; margin-top:4px; }
+  .btn-row { display:flex; gap:8px; flex-wrap:wrap; }
+  .ghost { width:auto; margin:0; padding:9px 14px; background:#0f1117; color:var(--text); border:1px solid var(--line);
+         border-radius:8px; font:inherit; font-size:14px; font-weight:500; cursor:pointer; }
+  .ghost:hover { border-color:var(--accent); }
+  .ghost.small { padding:6px 10px; font-size:13px; color:var(--muted); }
+  .video-box { padding:12px; background:#0f1117; border:1px dashed var(--line); border-radius:8px; }
+  .hint { margin-top:6px; font-size:12px; color:#6f7388; }
+
+  button.send { width:100%; margin-top:20px; padding:13px; border:0; border-radius:8px; background:var(--accent);
            color:#fff; font:inherit; font-weight:600; cursor:pointer; }
   button:disabled { opacity:.6; cursor:wait; }
-  #status { margin-top:14px; min-height:20px; font-size:14px; }
+  .bar { display:none; height:6px; margin-top:14px; background:#0f1117; border-radius:3px; overflow:hidden; }
+  .bar > div { height:100%; width:0; background:var(--accent); transition:width .15s; }
+  #status { margin-top:12px; min-height:20px; font-size:14px; }
   #status.ok { color:var(--ok); }
   #status.err { color:var(--accent); }
 </style>
@@ -31,14 +50,27 @@
     <p class="sub">Отправь отчёт разработчику</p>
 
     <form id="reportForm">
+      <label>Твоя иконка <span class="opt">(необязательно)</span></label>
+      <div class="pick">
+        <div class="icon-preview" id="iconPreview">🙂</div>
+        <div class="pick-info">
+          <div class="btn-row">
+            <button type="button" class="ghost" id="iconBtn">Выбрать иконку</button>
+            <button type="button" class="ghost small" id="iconClear" hidden>Убрать</button>
+          </div>
+          <div class="hint">Любая картинка, обрежется до квадрата</div>
+        </div>
+        <input type="file" id="iconInput" accept="image/*">
+      </div>
+
       <label for="nickname">Никнейм *</label>
-      <input id="nickname" maxlength="64" required>
+      <input type="text" id="nickname" maxlength="64" required>
 
       <label for="telegram">Telegram (@username — чтобы получить уведомление о статусе)</label>
-      <input id="telegram" maxlength="33" placeholder="@username">
+      <input type="text" id="telegram" maxlength="33" placeholder="@username">
 
       <label for="title">Желаемый титул</label>
-      <input id="title" maxlength="64">
+      <input type="text" id="title" maxlength="64">
 
       <label for="type">Категория</label>
       <select id="type">
@@ -47,77 +79,188 @@
         <option>Геймплей</option>
       </select>
 
-      <label for="media">Ссылка на скриншот / видео</label>
-      <input id="media" maxlength="500" placeholder="https://...">
+      <label>Видео <span class="opt">(необязательно)</span></label>
+      <div class="video-box">
+        <div class="btn-row">
+          <button type="button" class="ghost" id="videoBtn">Выбрать видео</button>
+          <button type="button" class="ghost small" id="videoClear" hidden>Убрать</button>
+        </div>
+        <div class="file-name" id="videoName">Файл не выбран</div>
+        <div class="hint">mp4, mov или webm, до 45 МБ. Если больше — сожми или обрежь.</div>
+        <input type="file" id="videoInput" accept="video/mp4,video/quicktime,video/webm,video/*">
+      </div>
+
+      <label for="media">Ссылка на скриншот / видео <span class="opt">(необязательно)</span></label>
+      <input type="text" id="media" maxlength="500" placeholder="https://...">
 
       <label for="description">Описание</label>
       <textarea id="description" maxlength="2000"></textarea>
 
-      <button id="send" type="submit">Отправить отчёт</button>
+      <button class="send" id="send" type="submit">Отправить отчёт</button>
+      <div class="bar" id="bar"><div id="barFill"></div></div>
       <div id="status"></div>
     </form>
   </div>
 
 <script>
     const API_URL = "https://dristick-tester-bot.onrender.com/api/report";
+    const MAX_VIDEO_MB = 45;
+    const ICON_SIZE = 256;
 
-    const form = document.getElementById("reportForm");
-    const btn = document.getElementById("send");
-    const statusEl = document.getElementById("status");
-    const val = id => document.getElementById(id).value.trim();
+    const $ = id => document.getElementById(id);
+    const form = $("reportForm"), sendBtn = $("send"), statusEl = $("status");
+    const bar = $("bar"), barFill = $("barFill");
+    let iconBlob = null, iconUrl = null, videoFile = null;
 
     function setStatus(text, cls) {
         statusEl.textContent = text;
         statusEl.className = cls || "";
     }
 
-    form.addEventListener("submit", async function (e) {
-        e.preventDefault();
+    function fmtSize(bytes) {
+        return bytes >= 1048576 ? (bytes / 1048576).toFixed(1) + " МБ" : Math.max(1, Math.round(bytes / 1024)) + " КБ";
+    }
 
-        if (API_URL.includes("YOUR-SERVICE")) {
-            setStatus("Укажи адрес сервиса в API_URL (index.html)", "err");
+    // ───── иконка: обрезаем до квадрата и сжимаем до 256×256 ─────
+    function makeIcon(file) {
+        return new Promise((resolve, reject) => {
+            const url = URL.createObjectURL(file);
+            const img = new Image();
+            img.onload = () => {
+                const side = Math.min(img.width, img.height);
+                const canvas = document.createElement("canvas");
+                canvas.width = canvas.height = ICON_SIZE;
+                canvas.getContext("2d").drawImage(
+                    img, (img.width - side) / 2, (img.height - side) / 2, side, side, 0, 0, ICON_SIZE, ICON_SIZE
+                );
+                URL.revokeObjectURL(url);
+                canvas.toBlob(b => (b ? resolve(b) : reject(new Error("blob"))), "image/png");
+            };
+            img.onerror = () => { URL.revokeObjectURL(url); reject(new Error("image")); };
+            img.src = url;
+        });
+    }
+
+    function clearIcon() {
+        iconBlob = null;
+        if (iconUrl) URL.revokeObjectURL(iconUrl);
+        iconUrl = null;
+        $("iconPreview").textContent = "🙂";
+        $("iconInput").value = "";
+        $("iconClear").hidden = true;
+    }
+
+    $("iconBtn").onclick = () => $("iconInput").click();
+    $("iconClear").onclick = clearIcon;
+    $("iconInput").onchange = async function () {
+        const file = this.files[0];
+        if (!file) return;
+        try {
+            iconBlob = await makeIcon(file);
+            if (iconUrl) URL.revokeObjectURL(iconUrl);
+            iconUrl = URL.createObjectURL(iconBlob);
+            const img = document.createElement("img");
+            img.src = iconUrl;
+            $("iconPreview").replaceChildren(img);
+            $("iconClear").hidden = false;
+            setStatus("");
+        } catch (e) {
+            clearIcon();
+            setStatus("❌ Не удалось прочитать картинку, выбери другую", "err");
+        }
+    };
+
+    // ───── видео ─────
+    function clearVideo() {
+        videoFile = null;
+        $("videoInput").value = "";
+        $("videoName").textContent = "Файл не выбран";
+        $("videoClear").hidden = true;
+    }
+
+    $("videoBtn").onclick = () => $("videoInput").click();
+    $("videoClear").onclick = clearVideo;
+    $("videoInput").onchange = function () {
+        const file = this.files[0];
+        if (!file) return;
+        if (file.size > MAX_VIDEO_MB * 1048576) {
+            clearVideo();
+            setStatus("❌ Видео " + fmtSize(file.size) + " — максимум " + MAX_VIDEO_MB + " МБ. Сожми или обрежь.", "err");
             return;
         }
+        videoFile = file;
+        $("videoName").textContent = file.name + " · " + fmtSize(file.size);
+        $("videoClear").hidden = false;
+        setStatus("");
+    };
 
-        btn.disabled = true;
-        setStatus("Отправка… сервер может просыпаться до минуты");
+    // ───── отправка (XHR, чтобы показывать прогресс загрузки) ─────
+    function upload(fd) {
+        return new Promise(resolve => {
+            const xhr = new XMLHttpRequest();
+            xhr.open("POST", API_URL);
+            xhr.timeout = 10 * 60 * 1000;
+            xhr.upload.onprogress = e => {
+                if (!e.lengthComputable) return;
+                const p = e.loaded / e.total;
+                barFill.style.width = Math.round(p * 100) + "%";
+                setStatus(p < 1 ? "Загрузка… " + Math.round(p * 100) + "%" : "Обработка…");
+            };
+            xhr.onload = () => {
+                let data = {};
+                try { data = JSON.parse(xhr.responseText); } catch (_) {}
+                resolve({ status: xhr.status, data });
+            };
+            xhr.onerror = () => resolve({ status: 0, data: {} });
+            xhr.ontimeout = () => resolve({ status: -1, data: {} });
+            xhr.send(fd);
+        });
+    }
 
-        const ctrl = new AbortController();
-        const timer = setTimeout(() => ctrl.abort(), 90000);
+    const ERRORS = {
+        duplicate: "Такой отчёт уже отправлен",
+        too_many_requests: "Слишком часто, подожди минуту",
+        video_too_large: "Видео слишком большое (максимум " + MAX_VIDEO_MB + " МБ)",
+        icon_too_large: "Иконка слишком большая",
+        bad_video: "Неподдерживаемый формат видео (нужен mp4, mov или webm)",
+        bad_icon: "Неподдерживаемый формат иконки",
+        nickname_required: "Укажи никнейм",
+        telegram_error: "Сервер не смог переслать отчёт, попробуй ещё раз"
+    };
 
-        try {
-            const res = await fetch(API_URL, {
-                method: "POST",
-                headers: { "Content-Type": "application/json" },
-                body: JSON.stringify({
-                    nickname: val("nickname"),
-                    telegram: val("telegram"),
-                    title: val("title"),
-                    type: val("type"),
-                    media: val("media"),
-                    description: val("description")
-                }),
-                signal: ctrl.signal
-            });
-            const data = await res.json().catch(() => ({}));
+    form.addEventListener("submit", async function (e) {
+        e.preventDefault();
+        sendBtn.disabled = true;
+        bar.style.display = videoFile ? "block" : "none";
+        barFill.style.width = "0";
+        setStatus("Отправка…");
 
-            if (res.ok && data.ok) {
-                setStatus("✅ Отчёт успешно отправлен!", "ok");
-                form.reset();
-            } else if (res.status === 409) {
-                setStatus("Такой отчёт уже отправлен", "err");
-            } else if (res.status === 429) {
-                setStatus("Слишком часто, подожди минуту", "err");
-            } else {
-                setStatus("❌ Ошибка отправки (" + res.status + ")", "err");
-            }
-        } catch (err) {
-            console.error(err);
+        const fd = new FormData();
+        fd.append("nickname", $("nickname").value.trim());
+        fd.append("telegram", $("telegram").value.trim());
+        fd.append("title", $("title").value.trim());
+        fd.append("type", $("type").value);
+        fd.append("media", $("media").value.trim());
+        fd.append("description", $("description").value.trim());
+        if (iconBlob) fd.append("icon", iconBlob, "icon.png");
+        if (videoFile) fd.append("video", videoFile, videoFile.name);
+
+        const { status, data } = await upload(fd);
+
+        if (status === 200 && data.ok) {
+            setStatus("✅ Отчёт успешно отправлен!", "ok");
+            form.reset();
+            clearIcon();
+            clearVideo();
+        } else if (status === 0) {
             setStatus("❌ Нет связи с сервером", "err");
-        } finally {
-            clearTimeout(timer);
-            btn.disabled = false;
+        } else if (status === -1) {
+            setStatus("❌ Слишком долго. Попробуй видео поменьше", "err");
+        } else {
+            setStatus("❌ " + (ERRORS[data.error] || "Ошибка отправки (" + status + ")"), "err");
         }
+        sendBtn.disabled = false;
+        setTimeout(() => { bar.style.display = "none"; }, 1500);
     });
 </script>
 </body>
